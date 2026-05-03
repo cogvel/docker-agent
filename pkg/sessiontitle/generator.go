@@ -13,9 +13,15 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/docker/docker-agent/pkg/chat"
 	"github.com/docker/docker-agent/pkg/model/provider"
 	"github.com/docker/docker-agent/pkg/model/provider/options"
+	"github.com/docker/docker-agent/pkg/telemetry/genai"
 )
 
 const (
@@ -55,10 +61,31 @@ func New(model provider.Provider, fallbackModels ...provider.Provider) *Generato
 // CreateChatCompletionStream, avoiding the overhead of spinning up a nested
 // runtime, and falls back to the next model on failure.
 // Returns an empty string if no models or messages are configured.
-func (g *Generator) Generate(ctx context.Context, sessionID string, userMessages []string) (string, error) {
+func (g *Generator) Generate(ctx context.Context, sessionID string, userMessages []string) (title string, err error) {
 	if g == nil || len(g.models) == 0 || len(userMessages) == 0 {
 		return "", nil
 	}
+
+	// Wrap the whole title-generation in a span so the boundary is
+	// visible on the session timeline. The inner per-attempt LLM
+	// calls each get their own `chat {model}` CLIENT child span via
+	// the provider decorator.
+	ctx, span := otel.Tracer("github.com/docker/docker-agent/pkg/sessiontitle").Start(
+		ctx,
+		"sessiontitle.generate",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(
+			attribute.String(genai.AttrConversationID, sessionID),
+			attribute.Int("cagent.sessiontitle.candidate_count", len(g.models)),
+		),
+	)
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
 
 	// Apply timeout to prevent hanging on slow or unresponsive models.
 	ctx, cancel := context.WithTimeout(ctx, titleGenerationTimeout)
@@ -70,7 +97,10 @@ func (g *Generator) Generate(ctx context.Context, sessionID string, userMessages
 
 	var lastErr error
 	for idx, baseModel := range g.models {
-		if err := ctx.Err(); err != nil {
+		// Assign to the named-return `err` so a context cancellation
+		// is observed by the deferred span closure as a recorded
+		// error rather than silently slipping through.
+		if err = ctx.Err(); err != nil { //nolint:gocritic // assigns to named return `err` for deferred span observability
 			return "", err
 		}
 
