@@ -11,6 +11,8 @@ import (
 	"slices"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
 
 	"github.com/docker/docker-agent/pkg/agent"
 	"github.com/docker/docker-agent/pkg/config"
@@ -18,6 +20,7 @@ import (
 	"github.com/docker/docker-agent/pkg/session"
 	"github.com/docker/docker-agent/pkg/team"
 	"github.com/docker/docker-agent/pkg/teamloader"
+	otelmcp "github.com/docker/docker-agent/pkg/telemetry/mcp"
 	"github.com/docker/docker-agent/pkg/tools"
 	"github.com/docker/docker-agent/pkg/version"
 )
@@ -60,10 +63,17 @@ func StartHTTPServer(ctx context.Context, agentFilename, agentName string, runCo
 
 	fmt.Printf("MCP HTTP server listening on http://%s\n", ln.Addr())
 
+	// Wrap with otelhttp so the MCP-over-HTTP transport extracts
+	// `traceparent` / `baggage` from incoming requests just like the
+	// stdio transport extracts them from `params._meta`. Without this
+	// HTTP-mode MCP clients lose trace context at the boundary.
 	httpServer := &http.Server{
-		Handler: mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
-			return server
-		}, nil),
+		Handler: otelhttp.NewHandler(
+			mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
+				return server
+			}, nil),
+			"mcp.http",
+		),
 	}
 
 	errCh := make(chan error, 1)
@@ -149,7 +159,25 @@ func createMCPServer(ctx context.Context, agentFilename, agentName string, runCo
 }
 
 func CreateToolHandler(t *team.Team, agentName string) func(context.Context, *mcp.CallToolRequest, ToolInput) (*mcp.CallToolResult, ToolOutput, error) {
-	return func(ctx context.Context, req *mcp.CallToolRequest, input ToolInput) (*mcp.CallToolResult, ToolOutput, error) {
+	return func(ctx context.Context, req *mcp.CallToolRequest, input ToolInput) (result *mcp.CallToolResult, output ToolOutput, err error) {
+		// Extract W3C trace context from `params._meta` (per the OTel
+		// MCP semconv) so the SERVER span chains onto the calling
+		// CLIENT span. Then start a `tools/call {agent}` SERVER span
+		// covering the full handler execution.
+		if req != nil && req.Params != nil {
+			ctx = otelmcp.ExtractMeta(ctx, req.Params.Meta)
+		}
+		ctx, span := otelmcp.StartServer(ctx, otelmcp.CallOptions{
+			Method:   otelmcp.MethodToolsCall,
+			ToolName: agentName,
+		})
+		defer func() {
+			if err != nil {
+				span.RecordError(err, "")
+			}
+			span.End()
+		}()
+
 		slog.Debug("MCP tool called", "agent", agentName, "message", input.Message)
 
 		ag, err := t.Agent(agentName)
@@ -169,6 +197,10 @@ func CreateToolHandler(t *team.Team, agentName string) func(context.Context, *mc
 
 		rt, err := runtime.New(t,
 			runtime.WithCurrentAgent(agentName),
+			// See pkg/a2a/adapter.go for rationale — without this
+			// the runtime's startSpan is a no-op when cagent runs as
+			// an MCP server, so all our runtime.* spans go silent.
+			runtime.WithTracer(otel.Tracer("cagent")),
 		)
 		if err != nil {
 			return nil, ToolOutput{}, fmt.Errorf("failed to create runtime: %w", err)
@@ -180,11 +212,11 @@ func CreateToolHandler(t *team.Team, agentName string) func(context.Context, *mc
 			return nil, ToolOutput{}, fmt.Errorf("agent execution failed: %w", err)
 		}
 
-		result := cmp.Or(sess.GetLastAssistantMessageContent(), "No response from agent")
+		response := cmp.Or(sess.GetLastAssistantMessageContent(), "No response from agent")
 
-		slog.Debug("Agent execution completed", "agent", agentName, "response_length", len(result))
+		slog.Debug("Agent execution completed", "agent", agentName, "response_length", len(response))
 
-		return nil, ToolOutput{Response: result}, nil
+		return nil, ToolOutput{Response: response}, nil
 	}
 }
 
